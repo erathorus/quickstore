@@ -1,4 +1,6 @@
 # Quickstore – fast and thread-safe key-value store with low contention and builtin cache
+[![Go Report Card](https://goreportcard.com/badge/github.com/erathorus/quickstore)](https://goreportcard.com/report/github.com/erathorus/quickstore)
+
 Quickstore is an opinionated key-value store built on top of DynamoDB.
 
 ## Features:
