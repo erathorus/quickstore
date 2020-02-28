@@ -1,4 +1,4 @@
-package qskey
+package quickstore
 
 import (
 	"testing"
@@ -77,3 +77,4 @@ func TestAnyKey_UnmarshalDynamoDBAttributeValue(t *testing.T) {
 		t.FailNow()
 	}
 }
+

@@ -1,4 +1,4 @@
-package qskey
+package quickstore
 
 import (
 	"crypto/rand"
@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	DELIM = '.'
+	delim = '.'
 )
 
 type Key struct {
@@ -33,7 +33,7 @@ func (k *Key) String() string {
 	if k.Parent == "" {
 		return s
 	}
-	return k.Parent + string(DELIM) + s
+	return k.Parent + string(delim) + s
 }
 
 func Parse(s string) Key {
@@ -68,7 +68,7 @@ func (k *Key) UnmarshalDynamoDBAttributeValue(av *dynamodb.AttributeValue) error
 }
 
 func divideKey(s string) (string, string) {
-	p := strings.LastIndexByte(s, DELIM)
+	p := strings.LastIndexByte(s, delim)
 	if p == -1 {
 		return "", s
 	}
@@ -83,3 +83,8 @@ func RandIdentifier() string {
 	}
 	return base64.URLEncoding.EncodeToString(b)
 }
+
+type KeyProvider interface {
+	MarshalQuickstoreKey() (Key, error)
+}
+

@@ -1,4 +1,4 @@
-package qskey
+package quickstore
 
 type registry struct {
 	kinds map[string]bool
@@ -11,3 +11,4 @@ func (r *registry) Register(kind string) {
 var Registry = registry{
 	kinds: make(map[string]bool),
 }
+
