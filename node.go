@@ -2,6 +2,7 @@ package quickstore
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 
 const (
 	cacheCapacity = 1 << 16
+	maxGet        = 1 << 16
 	timeout       = 60 * time.Second
 )
 
@@ -19,12 +21,12 @@ type node struct {
 	client *dynamodb.DynamoDB
 	table  string
 
-	qe     queue
+	queue  queue
 	cache  *simplelru.LRU
 	closed bool
 
-	mu   sync.Mutex
-	cond sync.Cond
+	locker  sync.Mutex
+	condSet condSet
 
 	done chan struct{}
 }
@@ -37,27 +39,23 @@ func newNode(client *dynamodb.DynamoDB, table string, bufSize int) (*node, error
 	n := &node{
 		client: client,
 		table:  table,
-		qe: queue{
-			cap:  bufSize,
-			muts: make([]mutation, bufSize),
-		},
 		cache:  cache,
 		closed: false,
 		done:   make(chan struct{}, 1),
 	}
-	n.cond.L = &n.mu
+	n.queue = newQueue(bufSize, &n.locker)
+	n.condSet = newCondSet(maxGet, &n.locker)
 	go n.flush()
 	return n, nil
 }
 
 func (n *node) insert(key Key, value interface{}) error {
-	ks := key.String()
 	avs, err := encodeItem(key, value)
 	if err != nil {
 		return err
 	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	n.locker.Lock()
+	defer n.locker.Unlock()
 	cached, err := n.getOrSaveCache(key)
 	if err != nil {
 		return err
@@ -65,11 +63,7 @@ func (n *node) insert(key Key, value interface{}) error {
 	if cached.state == stateExist {
 		return newErrItemExisted(key)
 	}
-	n.cache.Add(ks, cacheValue{
-		state: stateExist,
-		avs:   avs,
-	})
-	n.mutate(mutation{
+	n.mutate(key, mutation{
 		op:  opInsert,
 		avs: avs,
 	})
@@ -77,18 +71,13 @@ func (n *node) insert(key Key, value interface{}) error {
 }
 
 func (n *node) upsert(key Key, value interface{}) error {
-	ks := key.String()
 	avs, err := encodeItem(key, value)
 	if err != nil {
 		return err
 	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.cache.Add(ks, cacheValue{
-		state: stateExist,
-		avs:   avs,
-	})
-	n.mutate(mutation{
+	n.locker.Lock()
+	defer n.locker.Unlock()
+	n.mutate(key, mutation{
 		op:  opUpsert,
 		avs: avs,
 	})
@@ -96,13 +85,12 @@ func (n *node) upsert(key Key, value interface{}) error {
 }
 
 func (n *node) update(key Key, value interface{}) error {
-	ks := key.String()
 	avs, err := encodeItem(key, value)
 	if err != nil {
 		return err
 	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	n.locker.Lock()
+	defer n.locker.Unlock()
 	cached, err := n.getOrSaveCache(key)
 	if err != nil {
 		return err
@@ -110,11 +98,7 @@ func (n *node) update(key Key, value interface{}) error {
 	if cached.state == stateNotExist {
 		return newErrItemNotExisted(key)
 	}
-	n.cache.Add(ks, cacheValue{
-		state: stateExist,
-		avs:   avs,
-	})
-	n.mutate(mutation{
+	n.mutate(key, mutation{
 		op:  opUpdate,
 		avs: avs,
 	})
@@ -122,15 +106,32 @@ func (n *node) update(key Key, value interface{}) error {
 }
 
 func (n *node) delete(key Key) {
-	ks := key.String()
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.cache.Add(ks, cacheValue{state: stateNotExist})
-	n.mutate(mutation{op: opDelete})
+	n.locker.Lock()
+	defer n.locker.Unlock()
+	n.mutate(key, mutation{op: opDelete})
 }
 
-func (n *node) mutate(mut mutation) {
-
+func (n *node) mutate(key Key, mut mutation) {
+	n.queue.push(mut)
+	switch mut.op {
+	case opInsert:
+		n.cache.Add(key, cacheValue{
+			state: stateExist,
+			avs:   mut.avs,
+		})
+	case opUpsert:
+		n.cache.Add(key, cacheValue{
+			state: stateExist,
+			avs:   mut.avs,
+		})
+	case opUpdate:
+		n.cache.Add(key, cacheValue{
+			state: stateExist,
+			avs:   mut.avs,
+		})
+	case opDelete:
+		n.cache.Add(key, cacheValue{state: stateNotExist})
+	}
 }
 
 func (n *node) flush() {
@@ -142,7 +143,7 @@ type state int
 const (
 	stateNotExist state = iota
 	stateExist
-	stateUnknown
+	stateBusy
 )
 
 type cacheValue struct {
@@ -151,36 +152,42 @@ type cacheValue struct {
 }
 
 func (n *node) getOrSaveCache(key Key) (cacheValue, error) {
-	ks := key.String()
 	for {
-		untyped, ok := n.cache.Get(ks)
+		untyped, ok := n.cache.Get(key)
 		if !ok {
 			break
 		}
 		cached := untyped.(cacheValue)
-		if cached.state != stateUnknown {
+		if cached.state != stateBusy {
 			return cached, nil
 		}
-		n.cond.Wait()
+		ok = n.condSet.waitAndSignal(key)
+		if !ok {
+			return cacheValue{}, newErrTooManyRequests(fmt.Sprintf("trying to access too many different keys"))
+		}
 	}
-	value := cacheValue{state: stateUnknown}
-	n.cache.Add(ks, value)
-	n.mu.Unlock()
+	value := cacheValue{state: stateBusy}
+	n.cache.Add(key, value)
+	n.locker.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	defer n.condSet.signal(key)
+
 	encoded, err := encodeKey(key)
 	if err != nil {
-		n.mu.Lock()
+		n.locker.Lock()
+		n.cache.Remove(key)
 		return cacheValue{}, err
 	}
 	input := dynamodb.GetItemInput{
 		Key:       encoded,
 		TableName: &n.table,
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 	output, err := n.client.GetItemWithContext(ctx, &input)
 	if err != nil {
-		n.mu.Lock()
+		n.locker.Lock()
+		n.cache.Remove(key)
 		return cacheValue{}, newErrDynamoDBException(err)
 	}
 	if len(output.Item) == 0 {
@@ -189,10 +196,10 @@ func (n *node) getOrSaveCache(key Key) (cacheValue, error) {
 		value.state = stateExist
 		value.avs = output.Item
 	}
-	n.mu.Lock()
+	n.locker.Lock()
 	untyped, ok := n.cache.Get(key)
-	if !ok || untyped.(cacheValue).state == stateUnknown {
-		n.cache.Add(ks, value)
+	if !ok || untyped.(cacheValue).state == stateBusy {
+		n.cache.Add(key, value)
 		return value, nil
 	}
 	return untyped.(cacheValue), nil
@@ -246,23 +253,116 @@ type queue struct {
 	cap  int
 	len  int
 	l, r int
+
+	notFull  sync.Cond
+	notEmpty sync.Cond
+}
+
+func newQueue(cap int, locker sync.Locker) queue {
+	q := queue{
+		muts: make([]mutation, cap),
+		cap:  cap,
+	}
+	q.notFull.L = locker
+	q.notEmpty.L = locker
+	return q
+}
+
+func (q *queue) full() bool {
+	return q.len == q.cap
+}
+
+func (q *queue) empty() bool {
+	return q.len == 0
 }
 
 func (q *queue) push(mut mutation) {
+	for q.full() {
+		q.notFull.Wait()
+	}
 	q.muts[q.r] = mut
 	q.r++
 	if q.r == q.cap {
 		q.r = 0
 	}
 	q.len++
+	q.notEmpty.Signal()
 }
 
 func (q *queue) pop() mutation {
+	for q.empty() {
+		q.notEmpty.Wait()
+	}
 	mut := q.muts[q.l]
 	q.l++
 	if q.l == q.cap {
 		q.l = 0
 	}
 	q.len--
+	q.notFull.Signal()
 	return mut
+}
+
+type condSet struct {
+	locker sync.Locker
+	cap    int
+
+	entries map[Key]condCounter
+	notFull sync.Cond
+}
+
+type condCounter struct {
+	cond *sync.Cond
+	cnt  int
+}
+
+func (c condCounter) inc() condCounter {
+	c.cnt++
+	return c
+}
+
+func (c condCounter) dec() condCounter {
+	c.cnt--
+	return c
+}
+
+func newCondSet(cap int, locker sync.Locker) condSet {
+	c := condSet{
+		entries: make(map[Key]condCounter),
+		locker:  locker,
+		cap:     cap,
+	}
+	c.notFull.L = locker
+	return c
+}
+
+func (c *condSet) full() bool {
+	return len(c.entries) == c.cap
+}
+
+func (c *condSet) waitAndSignal(key Key) bool {
+	cc, ok := c.entries[key]
+	if !ok {
+		if c.full() {
+			return false
+		}
+		cc = condCounter{cond: &sync.Cond{L: c.locker}}
+	}
+	c.entries[key] = cc.inc()
+	cc.cond.Wait()
+	cc = c.entries[key]
+	if cc.cnt > 1 {
+		c.entries[key] = cc.dec()
+		cc.cond.Signal()
+	} else {
+		delete(c.entries, key)
+	}
+	return true
+}
+
+func (c *condSet) signal(key Key) {
+	cc, ok := c.entries[key]
+	if ok {
+		cc.cond.Signal()
+	}
 }

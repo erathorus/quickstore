@@ -8,6 +8,7 @@ const (
 	ErrCodeSerializeException = "SerializeException"
 	ErrCodeItemExisted        = "ItemExisted"
 	ErrCodeItemNotExisted     = "ItemNotExisted"
+	ErrCodeTooManyRequests    = "TooManyRequests"
 	ErrCodeDynamoDBException  = "DynamoDBException"
 )
 
@@ -69,6 +70,19 @@ func newErrDynamoDBException(cause error) *ErrDynamoDBException {
 			code:    ErrCodeDynamoDBException,
 			message: "error from DynamoDB",
 			cause:   cause,
+		},
+	}
+}
+
+type ErrTooManyRequests struct {
+	baseErr
+}
+
+func newErrTooManyRequests(message string) *ErrTooManyRequests {
+	return &ErrTooManyRequests{
+		baseErr: baseErr{
+			code:    ErrCodeTooManyRequests,
+			message: message,
 		},
 	}
 }
