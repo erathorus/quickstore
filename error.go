@@ -36,7 +36,7 @@ func newErrItemExisted(key Key) *ErrItemExisted {
 	return &ErrItemExisted{
 		baseErr: baseErr{
 			code:    ErrCodeItemExisted,
-			message: fmt.Sprintf("item with key %v is already existed", key),
+			message: fmt.Sprintf("item with key %v is already existed", key.String()),
 		},
 		key: key,
 	}

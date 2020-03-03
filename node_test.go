@@ -1,6 +1,7 @@
 package quickstore
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -34,14 +35,35 @@ func Test_node_insert(t *testing.T) {
 		Value: "Hi",
 	}
 	err := tn.insert(Key{
-		Parent: "a_parent",
-		Kind: "static_key",
-		Identifier: "hello",
+		Parent:     "a_parent",
+		Kind:       "hi",
+		Identifier: RandIdentifier(),
 	}, item)
 	if err != nil {
 		t.Log(err)
 		t.FailNow()
 	}
-	tn.close()
-	<-tn.done
+}
+
+func Test_node_multiple_upsert(t *testing.T) {
+	items := make([]Item, 100)
+	for i := 0; i < 100; i++ {
+		items[i].Name = "Name " + strconv.Itoa(i)
+		items[i].Value = "Value " + strconv.Itoa(i)
+	}
+	for i := 0; i < 100; i++ {
+		err := tn.insert(generateKey(), items[i])
+		if err != nil {
+			t.Log(err)
+			t.FailNow()
+		}
+	}
+}
+
+func generateKey() Key {
+	return Key{
+		Parent:     "par",
+		Kind:       "gen",
+		Identifier: RandIdentifier(),
+	}
 }

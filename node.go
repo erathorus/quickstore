@@ -14,7 +14,6 @@ import (
 const (
 	cacheCapacity = 1 << 16
 	maxGet        = 1 << 16
-	maxThreshold  = 25
 	timeout       = 60 * time.Second
 )
 
@@ -50,9 +49,6 @@ func newNode(client *dynamodb.DynamoDB, table string, bufSize int, flushThreshol
 	n.queue = newQueue(bufSize, &n.locker)
 	n.keyConds = newCondSet(maxGet, &n.locker)
 	n.flushCond.L = &n.locker
-	if n.threshold > maxThreshold {
-		n.threshold = maxThreshold
-	}
 	go n.flush()
 	return n, nil
 }
