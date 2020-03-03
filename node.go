@@ -14,37 +14,45 @@ import (
 const (
 	cacheCapacity = 1 << 16
 	maxGet        = 1 << 16
+	maxThreshold  = 25
 	timeout       = 60 * time.Second
 )
 
 type node struct {
-	client *dynamodb.DynamoDB
-	table  string
+	client    *dynamodb.DynamoDB
+	table     string
+	threshold int
 
 	queue  queue
 	cache  *simplelru.LRU
 	closed bool
 
-	locker  sync.Mutex
-	condSet condSet
+	locker    sync.Mutex
+	keyConds  condSet
+	flushCond sync.Cond
 
 	done chan struct{}
 }
 
-func newNode(client *dynamodb.DynamoDB, table string, bufSize int) (*node, error) {
+func newNode(client *dynamodb.DynamoDB, table string, bufSize int, flushThreshold int) (*node, error) {
 	cache, err := simplelru.NewLRU(cacheCapacity, nil)
 	if err != nil {
 		return nil, err
 	}
 	n := &node{
-		client: client,
-		table:  table,
-		cache:  cache,
-		closed: false,
-		done:   make(chan struct{}, 1),
+		client:    client,
+		table:     table,
+		threshold: flushThreshold,
+		cache:     cache,
+		closed:    false,
+		done:      make(chan struct{}, 1),
 	}
 	n.queue = newQueue(bufSize, &n.locker)
-	n.condSet = newCondSet(maxGet, &n.locker)
+	n.keyConds = newCondSet(maxGet, &n.locker)
+	n.flushCond.L = &n.locker
+	if n.threshold > maxThreshold {
+		n.threshold = maxThreshold
+	}
 	go n.flush()
 	return n, nil
 }
@@ -56,6 +64,9 @@ func (n *node) insert(key Key, value interface{}) error {
 	}
 	n.locker.Lock()
 	defer n.locker.Unlock()
+	if n.closed {
+		return newErrClosed()
+	}
 	cached, err := n.getOrSaveCache(key)
 	if err != nil {
 		return err
@@ -77,6 +88,9 @@ func (n *node) upsert(key Key, value interface{}) error {
 	}
 	n.locker.Lock()
 	defer n.locker.Unlock()
+	if n.closed {
+		return newErrClosed()
+	}
 	n.mutate(key, mutation{
 		op:  opUpsert,
 		avs: avs,
@@ -91,6 +105,9 @@ func (n *node) update(key Key, value interface{}) error {
 	}
 	n.locker.Lock()
 	defer n.locker.Unlock()
+	if n.closed {
+		return newErrClosed()
+	}
 	cached, err := n.getOrSaveCache(key)
 	if err != nil {
 		return err
@@ -105,14 +122,28 @@ func (n *node) update(key Key, value interface{}) error {
 	return nil
 }
 
-func (n *node) delete(key Key) {
+func (n *node) delete(key Key) error {
+	avs, err := encodeKey(key)
+	if err != nil {
+		return err
+	}
 	n.locker.Lock()
 	defer n.locker.Unlock()
-	n.mutate(key, mutation{op: opDelete})
+	if n.closed {
+		return newErrClosed()
+	}
+	n.mutate(key, mutation{
+		op:  opDelete,
+		avs: avs,
+	})
+	return nil
 }
 
 func (n *node) mutate(key Key, mut mutation) {
 	n.queue.push(mut)
+	if n.queue.len >= n.threshold {
+		n.flushCond.Signal()
+	}
 	switch mut.op {
 	case opInsert:
 		n.cache.Add(key, cacheValue{
@@ -134,8 +165,85 @@ func (n *node) mutate(key Key, mut mutation) {
 	}
 }
 
-func (n *node) flush() {
+func (n *node) close() {
+	n.locker.Lock()
+	defer n.locker.Unlock()
+	if n.closed {
+		return
+	}
+	n.closed = true
+	n.flushCond.Signal()
+}
 
+func (n *node) flush() {
+	defer func() {
+		n.done <- struct{}{}
+	}()
+	muts := make([]mutation, n.queue.cap)
+	var closed bool
+	var err error
+	for {
+		n.locker.Lock()
+		for !n.closed && n.queue.len < n.threshold {
+			n.flushCond.Wait()
+		}
+		closed = n.closed
+		muts = muts[:0]
+		for !n.queue.empty() {
+			muts = append(muts, n.queue.pop())
+		}
+		n.locker.Unlock()
+		ok := true
+		for i, mut := range muts {
+			err = n.execute(mut)
+			if err != nil {
+				muts = muts[i:]
+				ok = false
+				break
+			}
+		}
+		if !ok {
+			break
+		}
+		if closed {
+			return
+		}
+	}
+	n.locker.Lock()
+	n.closed = true
+	for n.queue.len > 0 {
+		muts = append(muts, n.queue.pop())
+	}
+	n.locker.Unlock()
+	panic(err)
+}
+
+func (n *node) execute(mut mutation) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	switch mut.op {
+	case opInsert:
+		fallthrough
+	case opUpsert:
+		fallthrough
+	case opUpdate:
+		input := dynamodb.PutItemInput{
+			Item:      mut.avs,
+			TableName: &n.table,
+		}
+		_, err := n.client.PutItemWithContext(ctx, &input)
+		return err
+	case opDelete:
+		input := dynamodb.DeleteItemInput{
+			Key:       mut.avs,
+			TableName: &n.table,
+		}
+		_, err := n.client.DeleteItemWithContext(ctx, &input)
+		return err
+	}
+
+	return nil
 }
 
 type state int
@@ -161,7 +269,7 @@ func (n *node) getOrSaveCache(key Key) (cacheValue, error) {
 		if cached.state != stateBusy {
 			return cached, nil
 		}
-		ok = n.condSet.waitAndSignal(key)
+		ok = n.keyConds.waitAndSignal(key)
 		if !ok {
 			return cacheValue{}, newErrTooManyRequests(fmt.Sprintf("trying to access too many different keys"))
 		}
@@ -170,7 +278,7 @@ func (n *node) getOrSaveCache(key Key) (cacheValue, error) {
 	n.cache.Add(key, value)
 	n.locker.Unlock()
 
-	defer n.condSet.signal(key)
+	defer n.keyConds.signal(key)
 
 	encoded, err := encodeKey(key)
 	if err != nil {

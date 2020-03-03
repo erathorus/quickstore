@@ -8,8 +8,9 @@ Quickstore acts as a cache layer on top of DynamoDB. All mutations are performed
  - In-memory database performance.
  - Low thread contention since data entries are partitioned into multiple nodes, allowing efficient parallelism.
  - Reduce number of call to DynamoDB using builtin-cache, cut down costs and reduce network latency to minimal.
- - Mutations are written out in batch using transaction, ensuring data consistency.
+ - Mutations are applied to cache and later applied to DynamoDB in a different thread.
  - Gracefully handling crash by logging unwritten mutations.
+ - Custom error types for fine-grained error handling.
 
 ## Restriction:
  - Primary key contains only partition key to avoid hot partition.

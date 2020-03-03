@@ -9,6 +9,7 @@ const (
 	ErrCodeItemExisted        = "ItemExisted"
 	ErrCodeItemNotExisted     = "ItemNotExisted"
 	ErrCodeTooManyRequests    = "TooManyRequests"
+	ErrCodeClosed             = "Closed"
 	ErrCodeDynamoDBException  = "DynamoDBException"
 )
 
@@ -83,6 +84,19 @@ func newErrTooManyRequests(message string) *ErrTooManyRequests {
 		baseErr: baseErr{
 			code:    ErrCodeTooManyRequests,
 			message: message,
+		},
+	}
+}
+
+type ErrClosed struct {
+	baseErr
+}
+
+func newErrClosed() *ErrClosed {
+	return &ErrClosed{
+		baseErr: baseErr{
+			code:    ErrCodeClosed,
+			message: "the store is already closed",
 		},
 	}
 }
