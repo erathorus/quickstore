@@ -5,6 +5,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestParse_Success(t *testing.T) {
@@ -15,9 +16,7 @@ func TestParse_Success(t *testing.T) {
 		Identifier: RandIdentifier(),
 	}
 	parsed := Parse(key.String())
-	if key != parsed {
-		t.FailNow()
-	}
+	assert.Equal(t, key, parsed)
 }
 
 func TestParse_Fail(t *testing.T) {
@@ -27,9 +26,7 @@ func TestParse_Fail(t *testing.T) {
 		Identifier: RandIdentifier(),
 	}
 	parsed := Parse(key.String())
-	if !parsed.Incomplete() {
-		t.FailNow()
-	}
+	assert.True(t, parsed.Incomplete())
 }
 
 func TestAnyKey_String(t *testing.T) {
@@ -38,9 +35,7 @@ func TestAnyKey_String(t *testing.T) {
 		Kind:       "apk",
 		Identifier: "3dF1k",
 	}
-	if key.String() != "key.parent.apk3dF1k" {
-		t.FailNow()
-	}
+	assert.Equal(t, "key.parent.apk3dF1k", key.String())
 }
 
 func TestAnyKey_MarshalDynamoDBAttributeValue(t *testing.T) {
@@ -52,12 +47,8 @@ func TestAnyKey_MarshalDynamoDBAttributeValue(t *testing.T) {
 	}
 	av := dynamodb.AttributeValue{}
 	err := key.MarshalDynamoDBAttributeValue(&av)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if *av.S != "abc1234" {
-		t.FailNow()
-	}
+	assert.NoError(t, err)
+	assert.Equal(t, "abc1234", *av.S)
 }
 
 func TestAnyKey_UnmarshalDynamoDBAttributeValue(t *testing.T) {
@@ -65,16 +56,11 @@ func TestAnyKey_UnmarshalDynamoDBAttributeValue(t *testing.T) {
 	av := dynamodb.AttributeValue{S: aws.String("abc1234")}
 	key := Key{}
 	err := key.UnmarshalDynamoDBAttributeValue(&av)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 	expected := Key{
 		Parent:     "",
 		Kind:       "abc",
 		Identifier: "1234",
 	}
-	if key != expected {
-		t.FailNow()
-	}
+	assert.Equal(t, expected, key)
 }
-

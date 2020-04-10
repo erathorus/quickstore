@@ -1,6 +1,8 @@
 package quickstore
 
 import (
+	"context"
+
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/cespare/xxhash"
 )
@@ -12,53 +14,90 @@ const (
 )
 
 type Store struct {
-	nodes []*node
+	nodes [numNodes]*node
 }
 
 func NewStore(client *dynamodb.DynamoDB, table string) (*Store, error) {
-	nodes := make([]*node, numNodes)
+	var nodes [numNodes]*node
 	var err error
-	for i := 0; i < len(nodes); i++ {
+	for i := 0; i < numNodes; i++ {
 		nodes[i], err = newNode(client, table, bufSize, flushThreshold)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return &Store{
+	s := &Store{
 		nodes: nodes,
-	}, nil
+	}
+	return s, nil
 }
 
-func (s *Store) Insert(kp KeyProvider, value interface{}) error {
-	key, err := kp.MarshalQuickstoreKey()
-	if err != nil {
-		return err
-	}
+func (s *Store) Insert(key Key, value interface{}) error {
 	return s.nodes[s.nodeOf(key)].insert(key, value)
 }
 
-func (s *Store) Upsert(kp KeyProvider, value interface{}) error {
-	key, err := kp.MarshalQuickstoreKey()
-	if err != nil {
-		return err
-	}
+func (s *Store) Upsert(key Key, value interface{}) error {
 	return s.nodes[s.nodeOf(key)].upsert(key, value)
 }
 
-func (s *Store) Update(kp KeyProvider, value interface{}) error {
-	key, err := kp.MarshalQuickstoreKey()
-	if err != nil {
-		return err
-	}
+func (s *Store) Update(key Key, value interface{}) error {
 	return s.nodes[s.nodeOf(key)].update(key, value)
 }
 
-func (s *Store) Delete(kp KeyProvider) error {
-	key, err := kp.MarshalQuickstoreKey()
-	if err != nil {
-		return err
-	}
+func (s *Store) Delete(key Key) error {
 	return s.nodes[s.nodeOf(key)].delete(key)
+}
+
+func (s *Store) Get(ctx context.Context, key Key) (*dynamodb.AttributeValue, error) {
+	return s.nodes[s.nodeOf(key)].get(ctx, key)
+}
+
+func (s *Store) GetMulti(ctx context.Context, keys map[Key]bool) (map[Key]*dynamodb.AttributeValue, error) {
+	items := make(map[Key]*dynamodb.AttributeValue)
+	var p [numNodes]map[Key]bool
+
+	for i := 0; i < numNodes; i++ {
+		p[i] = make(map[Key]bool)
+	}
+
+	for key := range keys {
+		p[s.nodeOf(key)][key] = true
+	}
+
+	for i := 0; i < numNodes; i++ {
+		if len(p[i]) == 0 {
+			continue
+		}
+		output, err := s.nodes[i].getMulti(ctx, p[i])
+		if err != nil {
+			return nil, err
+		}
+		for key, item := range output {
+			items[key] = item
+		}
+	}
+
+	return items, nil
+}
+
+func (s *Store) DoesItemExist(ctx context.Context, key Key) (bool, error) {
+	_, err := s.nodes[s.nodeOf(key)].get(ctx, key)
+	if err != nil {
+		if _, ok := err.(ErrItemNotExisted); ok {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) CloseAndWait() {
+	for i := 0; i < numNodes; i++ {
+		s.nodes[i].close()
+	}
+	for i := 0; i < numNodes; i++ {
+		<-s.nodes[i].done
+	}
 }
 
 func (s *Store) nodeOf(key Key) int {

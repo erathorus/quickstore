@@ -83,8 +83,3 @@ func RandIdentifier() string {
 	}
 	return base64.URLEncoding.EncodeToString(b)
 }
-
-type KeyProvider interface {
-	MarshalQuickstoreKey() (Key, error)
-}
-

@@ -12,9 +12,10 @@ import (
 )
 
 const (
-	cacheCapacity = 1 << 16
-	maxGet        = 1 << 16
-	timeout       = 60 * time.Second
+	cacheCapacity     = 1 << 16
+	maxGet            = 1 << 16
+	getMultiThreshold = 100
+	timeout           = 60 * time.Second
 )
 
 type node struct {
@@ -63,7 +64,9 @@ func (n *node) insert(key Key, value interface{}) error {
 	if n.closed {
 		return newErrClosed()
 	}
-	cached, err := n.getOrSaveCache(key)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cached, err := n.getOrSaveCache(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -104,7 +107,9 @@ func (n *node) update(key Key, value interface{}) error {
 	if n.closed {
 		return newErrClosed()
 	}
-	cached, err := n.getOrSaveCache(key)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cached, err := n.getOrSaveCache(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -159,6 +164,35 @@ func (n *node) mutate(key Key, mut mutation) {
 	case opDelete:
 		n.cache.Add(key, cacheValue{state: stateNotExist})
 	}
+}
+
+func (n *node) get(ctx context.Context, key Key) (*dynamodb.AttributeValue, error) {
+	n.locker.Lock()
+	cached, err := n.getOrSaveCache(ctx, key)
+	n.locker.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if cached.state == stateNotExist {
+		return nil, newErrItemNotExisted(key)
+	}
+	return &dynamodb.AttributeValue{M: cached.avs}, nil
+}
+
+func (n *node) getMulti(ctx context.Context, keys map[Key]bool) (map[Key]*dynamodb.AttributeValue, error) {
+	n.locker.Lock()
+	multiCached, err := n.getOrSaveCacheMulti(ctx, keys)
+	n.locker.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	items := make(map[Key]*dynamodb.AttributeValue)
+	for key, cached := range multiCached {
+		if cached.state == stateExist {
+			items[key] = &dynamodb.AttributeValue{M: cached.avs}
+		}
+	}
+	return items, nil
 }
 
 func (n *node) close() {
@@ -224,17 +258,11 @@ func (n *node) execute(mut mutation) error {
 	case opUpsert:
 		fallthrough
 	case opUpdate:
-		input := dynamodb.PutItemInput{
-			Item:      mut.avs,
-			TableName: &n.table,
-		}
+		input := dynamodb.PutItemInput{Item: mut.avs, TableName: &n.table}
 		_, err := n.client.PutItemWithContext(ctx, &input)
 		return err
 	case opDelete:
-		input := dynamodb.DeleteItemInput{
-			Key:       mut.avs,
-			TableName: &n.table,
-		}
+		input := dynamodb.DeleteItemInput{Key: mut.avs, TableName: &n.table}
 		_, err := n.client.DeleteItemWithContext(ctx, &input)
 		return err
 	}
@@ -255,7 +283,7 @@ type cacheValue struct {
 	avs   map[string]*dynamodb.AttributeValue
 }
 
-func (n *node) getOrSaveCache(key Key) (cacheValue, error) {
+func (n *node) getOrSaveCache(ctx context.Context, key Key) (cacheValue, error) {
 	for {
 		untyped, ok := n.cache.Get(key)
 		if !ok {
@@ -282,12 +310,7 @@ func (n *node) getOrSaveCache(key Key) (cacheValue, error) {
 		n.cache.Remove(key)
 		return cacheValue{}, err
 	}
-	input := dynamodb.GetItemInput{
-		Key:       encoded,
-		TableName: &n.table,
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	input := dynamodb.GetItemInput{Key: encoded, TableName: &n.table}
 	output, err := n.client.GetItemWithContext(ctx, &input)
 	if err != nil {
 		n.locker.Lock()
@@ -307,6 +330,109 @@ func (n *node) getOrSaveCache(key Key) (cacheValue, error) {
 		return value, nil
 	}
 	return untyped.(cacheValue), nil
+}
+
+func (n *node) fetchMulti(ctx context.Context, keys map[Key]bool) (map[Key]map[string]*dynamodb.AttributeValue, error) {
+	avs := make([]map[string]*dynamodb.AttributeValue, len(keys))
+	items := make(map[Key]map[string]*dynamodb.AttributeValue)
+	var err error
+
+	i := 0
+	for key := range keys {
+		avs[i], err = encodeKey(key)
+		if err != nil {
+			return nil, err
+		}
+		i++
+	}
+
+	for {
+		ng := len(avs)
+		if ng == 0 {
+			break
+		}
+		if ng > getMultiThreshold {
+			ng = getMultiThreshold
+		}
+		tables := make(map[string]*dynamodb.KeysAndAttributes)
+		tables[n.table] = &dynamodb.KeysAndAttributes{Keys: avs[:ng]}
+		avs = avs[ng:]
+		input := dynamodb.BatchGetItemInput{RequestItems: tables}
+		output, err := n.client.BatchGetItemWithContext(ctx, &input)
+		if err != nil {
+			return nil, err
+		}
+		if output.Responses != nil {
+			for _, item := range output.Responses[n.table] {
+				key, err := decodeKey(item)
+				if err != nil {
+					return nil, err
+				}
+				items[key] = item
+			}
+		}
+		if output.UnprocessedKeys != nil && output.UnprocessedKeys[n.table] != nil {
+			avs = append(avs, output.UnprocessedKeys[n.table].Keys...)
+		}
+	}
+
+	return items, nil
+}
+
+func (n *node) getOrSaveCacheMulti(ctx context.Context, keys map[Key]bool) (map[Key]cacheValue, error) {
+	items := make(map[Key]cacheValue)
+	notCached := make(map[Key]bool)
+
+	for key := range keys {
+		untyped, ok := n.cache.Get(key)
+		if !ok {
+			notCached[key] = true
+			continue
+		}
+		cached := untyped.(cacheValue)
+		if cached.state == stateBusy {
+			notCached[key] = true
+			continue
+		}
+		items[key] = cached
+	}
+
+	if len(notCached) == 0 {
+		return items, nil
+	}
+
+	n.locker.Unlock()
+	output, err := n.fetchMulti(ctx, notCached)
+	n.locker.Lock()
+	if err != nil {
+		return nil, err
+	}
+
+	for key := range keys {
+		untyped, ok := n.cache.Get(key)
+		if !ok || untyped.(cacheValue).state == stateBusy {
+			if notCached[key] {
+				avs, exists := output[key]
+				var cached cacheValue
+				if exists {
+					cached = cacheValue{
+						state: stateExist,
+						avs:   avs,
+					}
+				} else {
+					cached = cacheValue{
+						state: stateNotExist,
+					}
+				}
+				n.cache.Add(key, cached)
+				items[key] = cached
+			}
+			continue
+		}
+		items[key] = untyped.(cacheValue)
+	}
+
+	return items, nil
 }
 
 const (
@@ -336,6 +462,15 @@ func encodeKey(key Key) (map[string]*dynamodb.AttributeValue, error) {
 	avs := make(map[string]*dynamodb.AttributeValue)
 	avs[keyField] = av
 	return avs, nil
+}
+
+func decodeKey(avs map[string]*dynamodb.AttributeValue) (Key, error) {
+	key := Key{}
+	err := key.UnmarshalDynamoDBAttributeValue(avs[keyField])
+	if err != nil {
+		return Key{}, err
+	}
+	return key, nil
 }
 
 type opCode int
